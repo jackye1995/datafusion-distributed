@@ -345,6 +345,14 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
     move || Status::invalid_argument(format!("Missing field '{field}'"))
 }
 
+/// Upper bound on a single Flight IPC message produced by
+/// `build_flight_data_stream`. Shared with `worker_client`, whose receive
+/// loop pre-reserves exactly this many bytes before pulling the next
+/// message off the wire (see `execute_task`), so admission is checked
+/// against the worst case before the read -- not after the message has
+/// already been decoded into memory.
+pub(crate) const MAX_FLIGHT_DATA_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,
     compression_type: Option<CompressionType>,
@@ -380,7 +388,7 @@ fn build_flight_data_stream(
         // Splitting at a bounded size keeps that gate meaningful for this
         // shape of RecordBatch too, at the cost of the reassembly overhead
         // this used to avoid for large-but-ordinary batches.
-        .with_max_flight_data_size(16 * 1024 * 1024)
+        .with_max_flight_data_size(MAX_FLIGHT_DATA_SIZE_BYTES)
         .build(
             stream
                 // Apply garbage collection of dictionary and view arrays before sending over the network

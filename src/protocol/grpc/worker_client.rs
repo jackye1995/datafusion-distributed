@@ -5,6 +5,7 @@ use super::errors::{
 };
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
+use super::worker_service::MAX_FLIGHT_DATA_SIZE_BYTES;
 use crate::common::serialize_uuid;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::grpc::on_drop_stream::on_drop_stream;
@@ -184,6 +185,20 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     }
                 }
 
+                // Reserve the worst case *before* pulling the next message:
+                // by the time `interleaved_stream.next()` below resolves,
+                // tonic has already decoded the full message into memory,
+                // so checking the pool only after that point means the
+                // allocation already happened regardless of the outcome.
+                // `MAX_FLIGHT_DATA_SIZE_BYTES` bounds how large that message
+                // can be (see `worker_service::build_flight_data_stream`),
+                // so reserving it up front makes this a true admission
+                // check rather than a post-hoc one. Corrected down to the
+                // actual size once known, below.
+                if let Err(err) = memory_reservation.try_grow(MAX_FLIGHT_DATA_SIZE_BYTES) {
+                    return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
+                }
+
                 // Check for cancellation while waiting for the next message.
                 let flight_data = tokio::select! {
                     biased;
@@ -191,8 +206,14 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     msg = interleaved_stream.next() => {
                         match msg {
                             Some(Ok(v)) => v,
-                            Some(Err(err)) => return fanout(&per_partition_tx, err),
-                            None => return, // Stream exhausted
+                            Some(Err(err)) => {
+                                memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                                return fanout(&per_partition_tx, err);
+                            }
+                            None => {
+                                memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                                return; // Stream exhausted
+                            }
                         }
                     }
                 };
@@ -203,6 +224,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 let flight_metadata = match FlightAppMetadata::decode(flight_data.app_metadata.as_ref()) {
                     Ok(v) => v,
                     Err(err) => {
+                        memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
                         return fanout(&per_partition_tx, Status::internal(err.to_string()));
                     }
                 };
@@ -222,6 +244,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     let msg = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
+                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
                     return fanout(&per_partition_tx, Status::internal(msg));
                 };
 
@@ -229,6 +252,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     let msg = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
+                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
                     return fanout(&per_partition_tx, Status::internal(msg));
                 };
 
@@ -237,19 +261,28 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // memory reservation means releasing the memory from the pool for that specific
                 // message
                 let size = flight_data.encoded_len();
-                // Fallible: each message is bounded by `max_flight_data_size`
-                // (see `worker_service::build_flight_data_stream`), so this
-                // is a small, per-message amount, not the multi-gigabyte
-                // single message the reservation==0 escape hatch in the
-                // backpressure gate above exists to let through regardless
-                // of budget. Rejecting cleanly here is what makes the
-                // configured pool limit an actual bound across all
-                // concurrently active connections sharing it, rather than
+                // Correct the worst-case reservation taken above down to
+                // this message's actual size (the common case, since
+                // `size` is bounded by `MAX_FLIGHT_DATA_SIZE_BYTES`), or
+                // grow further for the residual if a non-compliant sender
+                // (e.g. an old worker, mid rolling-upgrade) exceeded that
+                // bound -- the admission check already happened above for
+                // the bounded portion every compliant sender stays within;
+                // this only ever allocates-before-checking for bytes beyond
+                // that bound, which a compliant sender never sends. Doing
+                // this per-message (rather than relying on one global
+                // budget) is what makes the pool limit an actual bound
+                // across however many connections share it, rather than
                 // just this connection's own buffer_budget_bytes, which
-                // several connections can each stay under while collectively
-                // exceeding the pool.
-                if let Err(err) = memory_reservation.try_grow(size) {
-                    return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
+                // several connections could each stay under while
+                // collectively exceeding the pool.
+                if size > MAX_FLIGHT_DATA_SIZE_BYTES {
+                    if let Err(err) = memory_reservation.try_grow(size - MAX_FLIGHT_DATA_SIZE_BYTES) {
+                        memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                        return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
+                    }
+                } else {
+                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES - size);
                 }
 
                 // Update memory related metrics.
