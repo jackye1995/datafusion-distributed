@@ -365,15 +365,22 @@ fn build_flight_data_stream(
         // Note that we do garbage collection of unused dictionary values above, so we are not sending
         // unused dictionary values over the wire.
         .with_dictionary_handling(DictionaryHandling::Resend)
-        // Set max flight data size to unlimited.
-        // This requires servers and clients to also be configured to handle unlimited sizes.
-        // Using unlimited sizes avoids splitting RecordBatches into multiple FlightData messages,
-        // which could add significant overhead for large RecordBatches.
-        // The only reason to split them really is if the client/server are configured with a message size limit,
-        // which mainly makes sense in a public network scenario where you want to avoid DoS attacks.
-        // Since all of our Arrow Flight communication happens within trusted data plane networks,
-        // we can safely use unlimited sizes here.
-        .with_max_flight_data_size(usize::MAX)
+        // Bound, rather than unlimited: `worker_client`'s receive loop applies
+        // backpressure per connection by refusing to pull the next FlightData
+        // message once `memory_reservation.size() >= buffer_budget_bytes`
+        // (see `execute_task`). That gate operates on individual FlightData
+        // messages, so it only has an effect if a RecordBatch can actually be
+        // split into more than one of them -- with an unlimited size, a
+        // RecordBatch consisting of a single row with one huge accumulated
+        // column (an aggregate's unbounded partial state, e.g. an exact
+        // MEDIAN over billions of rows) arrives as one message far larger
+        // than any configured budget, which the gate has no choice but to
+        // let through wholesale (see the reservation==0 comment below) --
+        // defeating the budget entirely regardless of how small it is set.
+        // Splitting at a bounded size keeps that gate meaningful for this
+        // shape of RecordBatch too, at the cost of the reassembly overhead
+        // this used to avoid for large-but-ordinary batches.
+        .with_max_flight_data_size(16 * 1024 * 1024)
         .build(
             stream
                 // Apply garbage collection of dictionary and view arrays before sending over the network
