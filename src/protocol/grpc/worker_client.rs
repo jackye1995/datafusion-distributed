@@ -1,5 +1,8 @@
 use super::channel_resolver::BoxCloneSyncChannel;
-use super::errors::{map_flight_to_datafusion_error, map_status_to_datafusion_error};
+use super::errors::{
+    datafusion_error_to_tonic_status, map_flight_to_datafusion_error,
+    map_status_to_datafusion_error,
+};
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
 use crate::common::serialize_uuid;
@@ -234,7 +237,20 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // memory reservation means releasing the memory from the pool for that specific
                 // message
                 let size = flight_data.encoded_len();
-                memory_reservation.grow(size);
+                // Fallible: each message is bounded by `max_flight_data_size`
+                // (see `worker_service::build_flight_data_stream`), so this
+                // is a small, per-message amount, not the multi-gigabyte
+                // single message the reservation==0 escape hatch in the
+                // backpressure gate above exists to let through regardless
+                // of budget. Rejecting cleanly here is what makes the
+                // configured pool limit an actual bound across all
+                // concurrently active connections sharing it, rather than
+                // just this connection's own buffer_budget_bytes, which
+                // several connections can each stay under while collectively
+                // exceeding the pool.
+                if let Err(err) = memory_reservation.try_grow(size) {
+                    return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
+                }
 
                 // Update memory related metrics.
                 msg_count.add(1);
