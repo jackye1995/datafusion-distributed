@@ -345,13 +345,30 @@ fn missing(field: &'static str) -> impl FnOnce() -> Status {
     move || Status::invalid_argument(format!("Missing field '{field}'"))
 }
 
-/// Upper bound on a single Flight IPC message produced by
-/// `build_flight_data_stream`. Shared with `worker_client`, whose receive
-/// loop pre-reserves exactly this many bytes before pulling the next
-/// message off the wire (see `execute_task`), so admission is checked
-/// against the worst case before the read -- not after the message has
-/// already been decoded into memory.
+/// Target size for a single Flight IPC message produced by
+/// `build_flight_data_stream`. This is an *approximate* splitting target,
+/// not a guarantee: `arrow-flight`'s splitter divides a `RecordBatch` by
+/// row count, estimated from its total size under an assumption of
+/// uniform row size, so it can never subdivide a single-row batch below
+/// one row no matter how large that row's own buffers are -- exactly the
+/// shape of an ungrouped aggregate's partial state (e.g. an exact
+/// MEDIAN's accumulated values, all in one row). `MAX_DECODE_MESSAGE_SIZE_BYTES`
+/// below is what actually bounds the worst case.
 pub(crate) const MAX_FLIGHT_DATA_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard ceiling on a single gRPC message, enforced by tonic against the
+/// wire-level length prefix *before* it allocates a buffer for the
+/// message body (see `tonic::codec::decode::Decoder::decode_chunk`) --
+/// unlike `MAX_FLIGHT_DATA_SIZE_BYTES` above, this one is a true
+/// admission check that runs before allocation, not an encoder-side
+/// target that can be exceeded. `create_worker_client` configures the
+/// client's `max_decoding_message_size` with this, and `worker_client`'s
+/// receive loop pre-reserves this many bytes from the memory pool before
+/// pulling the next message, matching the actual worst case tonic can
+/// let through rather than the encoder's unenforced target. 2x the
+/// Flight target to leave headroom for gRPC/protobuf framing overhead, per
+/// `Worker::with_max_message_size`'s own documented guidance.
+pub(crate) const MAX_DECODE_MESSAGE_SIZE_BYTES: usize = 2 * MAX_FLIGHT_DATA_SIZE_BYTES;
 
 fn build_flight_data_stream(
     stream: SendableRecordBatchStream,

@@ -5,7 +5,7 @@ use super::errors::{
 };
 use super::generated::worker as pb;
 use super::metrics_proto::metrics_set_proto_to_df;
-use super::worker_service::MAX_FLIGHT_DATA_SIZE_BYTES;
+use super::worker_service::MAX_DECODE_MESSAGE_SIZE_BYTES;
 use crate::common::serialize_uuid;
 use crate::grpc::generated::worker::FlightAppMetadata;
 use crate::grpc::on_drop_stream::on_drop_stream;
@@ -186,16 +186,22 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 }
 
                 // Reserve the worst case *before* pulling the next message:
-                // by the time `interleaved_stream.next()` below resolves,
-                // tonic has already decoded the full message into memory,
-                // so checking the pool only after that point means the
-                // allocation already happened regardless of the outcome.
-                // `MAX_FLIGHT_DATA_SIZE_BYTES` bounds how large that message
-                // can be (see `worker_service::build_flight_data_stream`),
-                // so reserving it up front makes this a true admission
-                // check rather than a post-hoc one. Corrected down to the
+                // by the time `interleaved_stream.next()` below resolves
+                // with a message, tonic has already decoded it into
+                // memory, so checking the pool only after that point means
+                // the allocation already happened regardless of the
+                // outcome. `MAX_DECODE_MESSAGE_SIZE_BYTES` is a true upper
+                // bound here (unlike the Flight encoder's own
+                // `MAX_FLIGHT_DATA_SIZE_BYTES` target, which can't actually
+                // bound a single-row batch -- see its doc comment): it's
+                // what `create_worker_client` configures
+                // `max_decoding_message_size` to, which tonic enforces
+                // against the wire-level length prefix *before* allocating
+                // a buffer for the message body, rejecting anything larger
+                // with `Status::out_of_range` via the `Some(Err(err))` arm
+                // below without ever allocating it. Corrected down to the
                 // actual size once known, below.
-                if let Err(err) = memory_reservation.try_grow(MAX_FLIGHT_DATA_SIZE_BYTES) {
+                if let Err(err) = memory_reservation.try_grow(MAX_DECODE_MESSAGE_SIZE_BYTES) {
                     return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
                 }
 
@@ -207,11 +213,11 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                         match msg {
                             Some(Ok(v)) => v,
                             Some(Err(err)) => {
-                                memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                                memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                                 return fanout(&per_partition_tx, err);
                             }
                             None => {
-                                memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                                memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                                 return; // Stream exhausted
                             }
                         }
@@ -224,7 +230,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 let flight_metadata = match FlightAppMetadata::decode(flight_data.app_metadata.as_ref()) {
                     Ok(v) => v,
                     Err(err) => {
-                        memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                        memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                         return fanout(&per_partition_tx, Status::internal(err.to_string()));
                     }
                 };
@@ -244,7 +250,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     let msg = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
-                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                    memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                     return fanout(&per_partition_tx, Status::internal(msg));
                 };
 
@@ -252,7 +258,7 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                     let msg = format!(
                         "Received partition {partition} in Flight metadata, but available partitions are {target_partition_range:?}"
                     );
-                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                    memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                     return fanout(&per_partition_tx, Status::internal(msg));
                 };
 
@@ -262,27 +268,27 @@ impl WorkerChannel for pb::worker_service_client::WorkerServiceClient<BoxCloneSy
                 // message
                 let size = flight_data.encoded_len();
                 // Correct the worst-case reservation taken above down to
-                // this message's actual size (the common case, since
-                // `size` is bounded by `MAX_FLIGHT_DATA_SIZE_BYTES`), or
-                // grow further for the residual if a non-compliant sender
-                // (e.g. an old worker, mid rolling-upgrade) exceeded that
-                // bound -- the admission check already happened above for
-                // the bounded portion every compliant sender stays within;
-                // this only ever allocates-before-checking for bytes beyond
-                // that bound, which a compliant sender never sends. Doing
+                // this message's actual size (the common case, since a
+                // successful `Some(Ok(flight_data))` above guarantees
+                // `size <= MAX_DECODE_MESSAGE_SIZE_BYTES`), or grow further
+                // for the residual in case `encoded_len()` -- computed on
+                // the decoded struct -- ever exceeds the wire-level length
+                // tonic checked (e.g. gRPC compression, not currently
+                // enabled anywhere in this crate, decoding to something
+                // bigger than the compressed bytes tonic measured). Doing
                 // this per-message (rather than relying on one global
                 // budget) is what makes the pool limit an actual bound
                 // across however many connections share it, rather than
                 // just this connection's own buffer_budget_bytes, which
                 // several connections could each stay under while
                 // collectively exceeding the pool.
-                if size > MAX_FLIGHT_DATA_SIZE_BYTES {
-                    if let Err(err) = memory_reservation.try_grow(size - MAX_FLIGHT_DATA_SIZE_BYTES) {
-                        memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES);
+                if size > MAX_DECODE_MESSAGE_SIZE_BYTES {
+                    if let Err(err) = memory_reservation.try_grow(size - MAX_DECODE_MESSAGE_SIZE_BYTES) {
+                        memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES);
                         return fanout(&per_partition_tx, datafusion_error_to_tonic_status(err));
                     }
                 } else {
-                    memory_reservation.shrink(MAX_FLIGHT_DATA_SIZE_BYTES - size);
+                    memory_reservation.shrink(MAX_DECODE_MESSAGE_SIZE_BYTES - size);
                 }
 
                 // Update memory related metrics.
@@ -581,11 +587,17 @@ fn fanout(o_txs: &[UnboundedSender<WorkerMsg>], err: Status) {
     }
 }
 
-/// Creates a [`WorkerServiceClient`] with high default message size limits.
+/// Creates a [`WorkerServiceClient`] with a high encoding limit, but a bounded
+/// decoding limit.
 ///
 /// This is a convenience function that wraps [`WorkerServiceClient::new`] and configures
-/// it with `max_decoding_message_size(usize::MAX)` and `max_encoding_message_size(usize::MAX)`
-/// to avoid message size limitations for internal communication.
+/// it with `max_encoding_message_size(usize::MAX)` (requests this client sends are small
+/// task keys and partition ranges, never worth limiting) and
+/// `max_decoding_message_size(MAX_DECODE_MESSAGE_SIZE_BYTES)` -- the responses this client
+/// receives can carry a large unbounded-partial-state `RecordBatch` (e.g. an exact MEDIAN's
+/// accumulated values), and tonic enforces this limit against the wire-level length prefix
+/// before allocating a buffer for the message body, so an oversized one is rejected cleanly
+/// instead of being allocated first.
 ///
 /// Users implementing custom [`ChannelResolver`]s should use this function in their
 /// `get_worker_client_for_url` implementations to ensure consistent behavior with built-in
@@ -617,7 +629,7 @@ fn fanout(o_txs: &[UnboundedSender<WorkerMsg>], err: Status) {
 pub fn create_worker_client(channel: BoxCloneSyncChannel) -> Box<dyn WorkerChannel> {
     Box::new(
         pb::worker_service_client::WorkerServiceClient::new(channel)
-            .max_decoding_message_size(usize::MAX)
+            .max_decoding_message_size(MAX_DECODE_MESSAGE_SIZE_BYTES)
             .max_encoding_message_size(usize::MAX),
     )
 }
